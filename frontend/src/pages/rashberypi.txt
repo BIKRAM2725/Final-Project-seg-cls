@@ -1,0 +1,92 @@
+pip install opencv-python requests pyzbar
+
+⚠️ if Raspberry Pi OS :
+
+sudo apt install libzbar0
+
+
+┌────────────┐        QR Pairing        ┌──────────────┐
+│  Website   │ ──────────────────────▶ │  FastAPI     │
+│ (React)    │                          │  Backend     │
+│            │ ◀──── WebSocket ─────── │              │
+└─────┬──────┘      (live status)       └──────┬───────┘
+      │                                         │
+      │ Live stream (MJPEG/WebRTC)              │ MQTT
+      ▼                                         ▼
+┌──────────────┐    frames + GPS     ┌─────────────────┐
+│ Raspberry Pi │ ─────────────────▶ │  AI YOLO Engine │
+│ / Drone Cam  │   (HTTP / MQTT)    └─────────────────┘
+└──────────────┘
+
+
+
+Drone (Pi Camera)
+   │
+   │ WebRTC (video)
+   ▼
+FastAPI + aiortc
+   │
+   │ WebSocket (status)
+   │ MQTT (GPS / frames meta)
+   ▼
+React Dashboard
+   ├── Live video (WebRTC)
+   ├── GPS map
+   └── AI results
+
+
+raspberrypi/
+│── camera.py
+│── mqtt_gps.py
+│── drone_client.py
+│── requirements.txt
+
+
+
+🔹 drone_client.py (AUTO PAIR + STREAM)
+import cv2, requests, time
+
+BACKEND = "http://YOUR_SERVER_IP:8000"
+
+# 1️⃣ Scan QR → token (simulate)
+TOKEN = input("Enter QR token: ")
+
+# 2️⃣ Pair
+res = requests.post(
+    f"{BACKEND}/drone/pair/accept",
+    data={"token": TOKEN}
+)
+session_id = res.json()["session_id"]
+print("Paired:", session_id)
+
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    _, img = cv2.imencode(".jpg", frame)
+    requests.post(
+        f"{BACKEND}/drone/frame",
+        files={"frame": img.tobytes()},
+        data={"session_id": session_id}
+    )
+
+    time.sleep(0.2)  # 5 FPS
+
+🔹 mqtt_gps.py (GPS + TELEMETRY)
+import paho.mqtt.client as mqtt
+import json, time
+
+client = mqtt.Client()
+client.connect("broker.hivemq.com", 1883)
+
+while True:
+    gps = {
+        "lat": 22.5726,
+        "lng": 88.3639,
+        "battery": 80
+    }
+    client.publish("drone/gps", json.dumps(gps))
+    time.sleep(2)
