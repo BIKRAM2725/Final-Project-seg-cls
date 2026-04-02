@@ -66,7 +66,7 @@ export default function DetectionHub() {
 
         {!mode && (
           <p className="text-center text-gray-500 text-sm sm:text-base">
-            👆 Select a detection mode to start
+            Select a detection mode to start
           </p>
         )}
       </div>

@@ -1,22 +1,27 @@
+import uuid, asyncio, cv2, numpy as np, os
 from fastapi import APIRouter, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
-import cv2, numpy as np, uuid, asyncio
 
 import state
-from core.live_session import LiveSession
+from core.live_session_advanced import LiveSessionAdvanced as LiveSession
 from core.detector import detect_image
 
-router = APIRouter(prefix="/drone")
+router = APIRouter(prefix="/drone", tags=["Drone Detection"])
+
+os.makedirs("temp", exist_ok=True)
 
 
-# ===================== PUSH STATUS =====================
+# ================= WS PUSH =================
 async def push_status(session_id, payload):
     ws = state.WS_CLIENTS.get(session_id)
     if ws:
-        await ws.send_json(payload)
+        try:
+            await ws.send_json(payload)
+        except:
+            state.WS_CLIENTS.pop(session_id, None)
 
 
-# ===================== PAIR CREATE =====================
+# ================= CREATE =================
 @router.post("/pair/create")
 def create_pair():
     token = str(uuid.uuid4())[:8]
@@ -25,16 +30,12 @@ def create_pair():
     state.PAIR_TOKENS[token] = session_id
     state.DRONE_SESSIONS[session_id] = LiveSession()
 
-    return {
-        "pair_token": token,
-        "session_id": session_id
-    }
+    return {"pair_token": token, "session_id": session_id}
 
 
-# ===================== PAIR ACCEPT =====================
+# ================= ACCEPT =================
 @router.post("/pair/accept")
 async def accept_pair(token: str = Form(...), device_id: str = Form(...)):
-
     if token not in state.PAIR_TOKENS:
         return JSONResponse(status_code=400, content={"error": "Invalid token"})
 
@@ -48,7 +49,7 @@ async def accept_pair(token: str = Form(...), device_id: str = Form(...)):
     return {"session_id": session_id}
 
 
-# ===================== FRAME =====================
+# ================= FRAME =================
 @router.post("/frame")
 async def drone_frame(frame: UploadFile = File(...), session_id: str = Form(...)):
 
@@ -57,71 +58,76 @@ async def drone_frame(frame: UploadFile = File(...), session_id: str = Form(...)
     if not session:
         return JSONResponse(status_code=400, content={"error": "Invalid session"})
 
-    img = cv2.imdecode(
-        np.frombuffer(await frame.read(), np.uint8),
-        cv2.IMREAD_COLOR
-    )
+    try:
+        img = cv2.imdecode(
+            np.frombuffer(await frame.read(), np.uint8),
+            cv2.IMREAD_COLOR
+        )
 
-    temp_path = f"temp/drone_{uuid.uuid4()}.jpg"
-    cv2.imwrite(temp_path, img)
+        if img is None:
+            return JSONResponse(status_code=400, content={"error": "Invalid image"})
 
-    result = detect_image(temp_path)
+        # 🔥 Improve drone frame quality
+        img = cv2.resize(img, (640, 640))
+        img = cv2.convertScaleAbs(img, alpha=1.3, beta=15)
 
-    print("DETECTION:", result)  # 🔥 DEBUG
+        temp_path = f"temp/{uuid.uuid4().hex}.jpg"
+        cv2.imwrite(temp_path, img)
 
-    detections = [{"class": "leaf", "conf": 1.0}]
+        # 🔥 MAIN AI (Seg + Cls)
+        result = detect_image(temp_path)
 
-    if result.get("primary_disease"):
-        detections.append({
-            "class": result["primary_disease"],
-            "conf": 1.0
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        print("✅ DRONE RESULT:", result)
+
+        # 🔥 UPDATE SESSION (IMPORTANT)
+        session.update(result, frame_quality_ok=True)
+
+        # MJPEG stream
+        ok, jpeg = cv2.imencode(".jpg", img)
+        if ok:
+            state.LAST_FRAMES[session_id] = jpeg.tobytes()
+
+        # Dummy GPS
+        if session_id not in state.GPS_DATA:
+            state.GPS_DATA[session_id] = {
+                "lat": 22.5726,
+                "lng": 88.3639
+            }
+
+        # 🔥 SEND TO FRONTEND
+        await push_status(session_id, {
+            "status": "streaming",
+            "result": result,
+            "gps": state.GPS_DATA.get(session_id)
         })
 
-    session.update(detections)
+        return {"ok": True}
 
-    # MJPEG frame
-    ok, jpeg = cv2.imencode(".jpg", img)
-    if ok:
-        state.LAST_FRAMES[session_id] = jpeg.tobytes()
-
-    # WS push
-    await push_status(session_id, {
-        "status": "streaming",
-        "detections": detections,
-        "gps": state.GPS_DATA.get(session_id)
-    })
-
-    return {"ok": True}
+    except Exception as e:
+        print("FRAME ERROR:", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# ===================== GPS =====================
+# ================= GPS =================
 @router.post("/gps")
-async def drone_gps(
-    session_id: str = Form(...),
-    lat: float = Form(...),
-    lng: float = Form(...)
-):
-
+async def drone_gps(session_id: str = Form(...), lat: float = Form(...), lng: float = Form(...)):
     if session_id not in state.DRONE_SESSIONS:
         return JSONResponse(status_code=400, content={"error": "Invalid session"})
 
-    state.GPS_DATA[session_id] = {
-        "lat": lat,
-        "lng": lng
-    }
+    state.GPS_DATA[session_id] = {"lat": lat, "lng": lng}
 
-    # 🔥 IMPORTANT: send both formats
     await push_status(session_id, {
         "status": "gps",
-        "gps": state.GPS_DATA[session_id],
-        "lat": lat,
-        "lng": lng
+        "gps": state.GPS_DATA[session_id]
     })
 
     return {"ok": True}
 
 
-# ===================== STOP =====================
+# ================= STOP =================
 @router.post("/stop/{session_id}")
 async def stop_analysis(session_id: str):
 
@@ -140,14 +146,13 @@ async def stop_analysis(session_id: str):
     return result
 
 
-# ===================== MJPEG =====================
+# ================= MJPEG =================
 @router.get("/mjpeg/{session_id}")
 async def mjpeg_stream(session_id: str):
 
     async def gen():
         while True:
             frame = state.LAST_FRAMES.get(session_id)
-
             if frame:
                 yield (
                     b"--frame\r\n"
@@ -155,7 +160,6 @@ async def mjpeg_stream(session_id: str):
                     frame +
                     b"\r\n"
                 )
-
             await asyncio.sleep(0.05)
 
     return StreamingResponse(
@@ -164,16 +168,14 @@ async def mjpeg_stream(session_id: str):
     )
 
 
-# ===================== WEBSOCKET =====================
+# ================= WS =================
 @router.websocket("/ws/{session_id}")
 async def ws_endpoint(ws: WebSocket, session_id: str):
-
     await ws.accept()
     state.WS_CLIENTS[session_id] = ws
 
     try:
         while True:
             await ws.receive_text()
-
     except WebSocketDisconnect:
         state.WS_CLIENTS.pop(session_id, None)

@@ -3,7 +3,7 @@ import jsPDF from "jspdf";
 export default function generateLivePDF({
   primary_disease,
   severity,
-  infection_ratio,
+  infected_leaf_percent,
   avg_confidence,
   recommendation,
 }) {
@@ -48,7 +48,7 @@ export default function generateLivePDF({
   doc.text(`Severity Level: ${severity}`, 10, y);
   y += 7;
 
-  doc.text(`Infected Duration: ${infection_ratio}%`, 10, y);
+  doc.text(`Infected Duration: ${infected_leaf_percent}%`, 10, y);
   y += 7;
 
   doc.text(`Detection Confidence: ${avg_confidence}%`, 10, y);
